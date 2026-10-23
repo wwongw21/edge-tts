@@ -232,14 +232,18 @@ def split_text_by_byte_length(
 
         if split_at < 0:
             ## No newline or space found, so we need to find a safe UTF-8 split point
-            split_at = _find_safe_utf8_split_point(text)
+            split_at = _find_safe_utf8_split_point(text[:byte_length])
 
         # Adjust the split point to avoid cutting in the middle of an xml entity, such as '&amp;'
         split_at = _adjust_split_point_for_xml_entity(text, split_at)
 
-        if split_at < 0:
-            # This should not happen if byte_length is reasonable,
-            # but guards against edge cases.
+        if split_at == 0 and text[:1].isspace():
+            # Whitespace at the start would be removed by strip() anyway.
+            text = text[1:]
+            continue
+
+        if split_at <= 0:
+            # Do not skip a character or XML entity when no safe chunk fits.
             raise ValueError(
                 "Maximum byte length is too small or "
                 "invalid text structure near '&' or invalid UTF-8"
@@ -320,7 +324,8 @@ def ssml_headers_plus_data(request_id: str, timestamp: str, ssml: str) -> str:
 
 class Communicate:
     """
-    Communicate with the service.
+    Communicate with the service. A supplied connector remains owned by the
+    caller, which must close it after all communications using it have finished.
     """
 
     # pylint: disable=too-many-arguments
@@ -460,6 +465,7 @@ class Communicate:
         # Create a new connection to the service.
         async with aiohttp.ClientSession(
             connector=self.connector,
+            connector_owner=self.connector is None,
             trust_env=True,
             timeout=self.session_timeout,
         ) as session, session.ws_connect(
@@ -621,27 +627,40 @@ class Communicate:
                     metadata.write("\n")
 
     def stream_sync(self) -> Generator[TTSChunk, None, None]:
-        """Synchronous interface for async stream method"""
+        """Synchronous interface for async stream method.
+
+        Closing this iterator early waits for the async producer to finish.
+        """
 
         def fetch_async_items(queue: Queue) -> None:  # type: ignore
             async def get_items() -> None:
                 async for item in self.stream():
                     queue.put(item)
-                queue.put(None)
 
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(get_items())
-            loop.close()
+            loop = None
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(get_items())
+            finally:
+                try:
+                    if loop is not None:
+                        loop.close()
+                finally:
+                    try:
+                        asyncio.set_event_loop(None)
+                    finally:
+                        queue.put(None)
 
         queue: Queue = Queue()  # type: ignore
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            executor.submit(fetch_async_items, queue)
+            future = executor.submit(fetch_async_items, queue)
 
             while True:
                 item = queue.get()
                 if item is None:
+                    future.result()
                     break
                 yield item
 
